@@ -1,0 +1,273 @@
+// =========================================================================
+// GRADINGENGINE.GS - Handles Submissions & PDF Generation
+// =========================================================================
+
+function processCustomExamSubmission(payload) {
+  try {
+    const teacherSs = SpreadsheetApp.openById(payload.teacherSheetId);
+    let responseSheet = teacherSs.getSheetByName("Master Exam Responses");
+    if (!responseSheet) throw new Error("'Master Exam Responses' sheet is missing in teacher's file.");
+
+    let rowData = [new Date(), payload.testId, payload.name, payload.phone, "", "", "", "", "Pending", "", ""];
+    if (payload.answers && payload.answers.length > 0) {
+      payload.answers.forEach(ans => {
+        if (typeof ans === 'object') rowData.push(JSON.stringify(ans)); 
+        else rowData.push(ans);
+      });
+    }
+    responseSheet.appendRow(rowData);
+    
+    try {
+      let newRowNumber = responseSheet.getLastRow();
+      let mockEvent = {
+        source: teacherSs,
+        range: responseSheet.getRange(newRowNumber, 1, 1, responseSheet.getLastColumn()),
+        namedValues: { "Student Full Name": [payload.name], "Mobile Number": [payload.phone], "Timestamp": [new Date().toLocaleString()] }
+      };
+      autoGenerateReportCard(mockEvent);
+    } catch (triggerError) { console.warn("PDF Engine Trigger failed: " + triggerError.message); }
+    
+    return { success: true };
+  } catch (error) { return { error: error.message }; }
+}
+
+function autoGenerateReportCard(e) {
+  if (!e) return;
+  try {
+    const sheet = e.range.getSheet();
+    const row = e.range.getRow();
+    const responses = e.namedValues;
+    const name = responses["Student Full Name"] ? responses["Student Full Name"][0] : "Student";
+    const phone = responses["Mobile Number"] ? responses["Mobile Number"][0] : "";
+    const timestamp = responses["Timestamp"] ? responses["Timestamp"][0] : new Date().toLocaleString();
+    
+    let testId = sheet.getRange(row, 2).getValue() || sheet.getName();
+    
+    const ss = e.source;
+    const dash = ss.getSheetByName("Dashboard");
+    const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+    const cleanStr = function(str) { return String(str).toLowerCase().replace(/[^a-z0-9]/g, "").trim(); };
+
+    let prettyExamName = testId;
+    try {
+      let depData = ss.getSheetByName("Active Deployments").getDataRange().getValues();
+      let depRow = depData.find(r => r[1] === testId);
+      if (depRow) prettyExamName = depRow[2]; 
+    } catch(err) {}
+
+    let examQuestions = [];
+    const keySheet = ss.getSheetByName("System Answer Keys");
+    if (keySheet) {
+      let data = keySheet.getDataRange().getValues();
+      for (let i = 1; i < data.length; i++) {
+        if (data[i][0] === testId) { 
+          examQuestions.push({ qTitle: data[i][3], correctAnswer: String(data[i][4]).trim(), explanation: String(data[i][5]).trim(), qType: String(data[i][6] || "Theory").trim(), qPoints: parseFloat(data[i][7]) || 1 });
+        }
+      }
+    }
+
+    if (examQuestions.length === 0) throw new Error("Could not find Answer Key for this exam.");
+
+    const docName = `[Diagnostic] ${name} - ${prettyExamName}`;
+    const doc = DocumentApp.create(docName);
+    const docBody = doc.getBody();
+    doc.setMarginLeft(36); doc.setMarginRight(36); doc.setMarginTop(36); doc.setMarginBottom(36);
+
+    // FIXED: Uses getDashValue so it never breaks if rows shift!
+    let instName = getDashValue(dash, "Institute Name") || "Institute Name";
+    let brandPara = docBody.appendParagraph(instName);
+    brandPara.setHeading(DocumentApp.ParagraphHeading.HEADING1).setAlignment(DocumentApp.HorizontalAlignment.CENTER).editAsText().setFontSize(24).setBold(true).setFontFamily("Cambria");
+    docBody.appendParagraph("PERFORMANCE & DIAGNOSTIC SCORECARD").setHeading(DocumentApp.ParagraphHeading.HEADING2).setAlignment(DocumentApp.HorizontalAlignment.CENTER).editAsText().setFontSize(14).setBold(true).setFontFamily("Arial").setForegroundColor("#0f172a");
+    docBody.appendHorizontalRule();
+
+    let metaTable = docBody.appendTable([ ["📋 Candidate Info", `Name: ${name}\nMobile: ${phone}`], ["📝 Assessment Info", `Exam Scope: ${prettyExamName}\nDate: ${timestamp}`] ]);
+    metaTable.setBorderWidth(0); metaTable.setColumnWidth(0, 150); metaTable.setColumnWidth(1, 370);
+    for(let r=0; r<2; r++) {
+      metaTable.getRow(r).getCell(0).setPaddingTop(6).setPaddingBottom(6).setBackgroundColor("#f8fafc").editAsText().setBold(true).setFontSize(11).setFontFamily("Arial");
+      metaTable.getRow(r).getCell(1).setPaddingTop(6).setPaddingBottom(6).setBackgroundColor("#ffffff").editAsText().setFontSize(11).setFontFamily("Arial");
+    }
+    docBody.appendParagraph("").setSpacingBefore(10);
+
+    let studentRowValues = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+    let totalEarnedMarks = 0, totalMaxMarks = 0, qCounter = 1, evalLog = [], topicStats = {};
+    
+    // FIXED: Uses getDashValue for the folder
+    let folderId = getDashValue(dash, "Output Folder Link");
+    if (folderId && folderId.includes("drive.google.com")) {
+      let match = folderId.match(/[-\w]{25,}/);
+      if (match) folderId = match[0];
+    }
+    let uploadFolder;
+    try { uploadFolder = DriveApp.getFolderById(folderId); } catch(fErr) { uploadFolder = DriveApp.getRootFolder(); }
+
+    let answerStartIndex = 11; 
+
+    for (let i = 0; i < examQuestions.length; i++) {
+      let qData = examQuestions[i];
+      let headerName = qData.qTitle;
+      let studentAnswer = studentRowValues[answerStartIndex + i] || "[No Response]";
+      
+      let qMaxMarks = qData.qPoints;
+      let qType = qData.qType;
+      let topicMatch = headerName.match(/\[(.*?)\]/);
+      let topicName = topicMatch ? topicMatch[1].trim() : "General Concepts";
+      let earnedForQ = 0;
+      let isObjective = (qType === "MCQ" || qType === "Assertion-Reason");
+      let hasImageAttachment = false, attachedFileUrl = "", textContent = String(studentAnswer);
+
+      if (!isObjective && typeof studentAnswer === 'string' && studentAnswer.trim().indexOf('{') === 0) {
+        try {
+          let parsedAns = JSON.parse(studentAnswer);
+          if (parsedAns.base64) {
+            hasImageAttachment = true;
+            textContent = parsedAns.textNotes || "[Image Attached]";
+            let imgBlob = Utilities.newBlob(Utilities.base64Decode(parsedAns.base64), parsedAns.mimeType || "image/jpeg", parsedAns.filename || "submission.jpg");
+            let savedFile = uploadFolder.createFile(imgBlob);
+            savedFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+            attachedFileUrl = savedFile.getUrl();
+            sheet.getRange(row, answerStartIndex + i + 1).setValue(attachedFileUrl);
+          }
+        } catch(jsonErr) { textContent = String(studentAnswer); }
+      } else if (textContent.indexOf("http") > -1 && textContent.indexOf("drive.google.com") > -1) {
+        hasImageAttachment = true; attachedFileUrl = textContent.trim();
+      }
+
+      if (isObjective) {
+        let isCorrect = false;
+        if (studentAnswer !== "[No Response]") {
+          let normStudent = cleanStr(studentAnswer), normMaster = cleanStr(qData.correctAnswer);
+          if (normStudent === normMaster || normStudent.includes(normMaster) || normMaster.includes(normStudent)) isCorrect = true;
+        }
+        if (isCorrect) {
+          earnedForQ = qMaxMarks;
+          evalLog.push({ num: qCounter, q: headerName, a: studentAnswer, res: `🟢 Correct (${qMaxMarks}/${qMaxMarks})`, note: "" });
+        } else {
+          evalLog.push({ num: qCounter, q: headerName, a: studentAnswer, res: `🔴 Incorrect (0/${qMaxMarks})`, note: `Expected: ${qData.correctAnswer}` });
+        }
+      }
+      else {
+        if (textContent === "[No Response]" || textContent.trim() === "") {
+          evalLog.push({ num: qCounter, q: headerName, a: "[No Response]", res: `🔴 Skipped (0/${qMaxMarks})`, note: `Expected: ${qData.explanation}` });
+        }
+        else if (apiKey) {
+          try {
+            let aiParts = [{ text: `You are an expert examiner grading a professional test.\nQuestion: "${headerName}"\nStudent Answer Context: "${textContent}"\n${hasImageAttachment ? 'CRITICAL: The student has attached a handwritten sheet image. Read the numbers and text from the image carefully.' : ''}\nMaster Key Marking Rubric: "${qData.explanation}"\nMax Marks: ${qMaxMarks}.\nReturn strictly JSON formatting: {"awardedMarks": float, "justification": "short clear reason"}` }];
+            if (hasImageAttachment && attachedFileUrl) {
+              try {
+                let fileId = attachedFileUrl.match(/[-\w]{25,}/)[0];
+                let blob = DriveApp.getFileById(fileId).getBlob();
+                aiParts.push({ inlineData: { mimeType: blob.getContentType(), data: Utilities.base64Encode(blob.getBytes()) } });
+              } catch(visionErr) { console.warn("Vision fallback text parsing: " + visionErr.message); }
+            }
+            let aiPayload = { contents: [{ parts: aiParts }], generationConfig: { responseMimeType: "application/json", temperature: 0.1 } };
+            let aiRes = UrlFetchApp.fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, { method: "POST", contentType: "application/json", payload: JSON.stringify(aiPayload), muteHttpExceptions: true });
+            if (aiRes.getResponseCode() === 200) {
+              let aiData = JSON.parse(JSON.parse(aiRes.getContentText()).candidates[0].content.parts[0].text);
+              earnedForQ = parseFloat(aiData.awardedMarks) || 0;
+              evalLog.push({ num: qCounter, q: headerName, a: attachedFileUrl || textContent, res: `${earnedForQ === qMaxMarks ? '🟢' : '🟡'} Evaluated (${earnedForQ}/${qMaxMarks})`, note: aiData.justification, isUrl: hasImageAttachment });
+            } else { throw new Error("API Offline"); }
+          } catch(err) {
+            evalLog.push({ num: qCounter, q: headerName, a: attachedFileUrl || textContent, res: `🟡 Awaiting Manual Review (0/${qMaxMarks})`, note: "Evaluation Processing Engine Timeout.", isUrl: hasImageAttachment });
+          }
+        }
+        else {
+          evalLog.push({ num: qCounter, q: headerName, a: textContent, res: `🟡 Awaiting Manual Review (0/${qMaxMarks})`, note: "No active evaluation API key configured." });
+        }
+      }
+
+      if (!topicStats[topicName]) { topicStats[topicName] = { earned: 0, max: 0 }; }
+      topicStats[topicName].max += qMaxMarks;
+      topicStats[topicName].earned += earnedForQ;
+      totalEarnedMarks += earnedForQ;
+      totalMaxMarks += qMaxMarks;
+      qCounter++;
+    }
+
+    docBody.appendParagraph(`Overall Performance Index: ${totalEarnedMarks} / ${totalMaxMarks}`).setBold(true).setHeading(DocumentApp.ParagraphHeading.HEADING3).editAsText().setFontSize(16).setFontFamily("Arial").setForegroundColor("#1e3a8a");
+    docBody.appendHorizontalRule();
+    docBody.appendParagraph("📊 Concept Mastery & Remediation Plan").setBold(true).setHeading(DocumentApp.ParagraphHeading.HEADING3).editAsText().setFontSize(14).setFontFamily("Arial");
+    let diagTable = docBody.appendTable();
+    diagTable.setBorderWidth(1).setBorderColor("#cbd5e1");
+    let thr = diagTable.appendTableRow();
+    thr.appendTableCell("Syllabus Sub-Topic").setBold(true).setBackgroundColor("#1e40af").editAsText().setForegroundColor("#ffffff").setFontSize(11).setFontFamily("Arial");
+    thr.appendTableCell("Proficiency").setBold(true).setBackgroundColor("#1e40af").editAsText().setForegroundColor("#ffffff").setFontSize(11).setFontFamily("Arial");
+    thr.appendTableCell("Strategic Action Plan").setBold(true).setBackgroundColor("#1e40af").editAsText().setForegroundColor("#ffffff").setFontSize(11).setFontFamily("Arial");
+    diagTable.setColumnWidth(0, 180); diagTable.setColumnWidth(1, 95); diagTable.setColumnWidth(2, 245);
+
+    let topicTableData = Charts.newDataTable().addColumn(Charts.ColumnType.STRING, 'Topic').addColumn(Charts.ColumnType.NUMBER, 'Score (%)');
+
+    for (let t in topicStats) {
+      let pct = Math.round((topicStats[t].earned / topicStats[t].max) * 100);
+      topicTableData.addRow([t, pct]);
+      let statusTag, advice, colorBg;
+      if (pct >= 80) { statusTag = `🟢 Ready (${pct}%)`; advice = "Concept locked. Ready for higher difficulty tests."; colorBg = "#ecfdf5"; }
+      else if (pct >= 50) { statusTag = `🟡 Review (${pct}%)`; advice = "Review active notebook formulas & practice 5 standard illustrations."; colorBg = "#fffbeb"; }
+      else { statusTag = `🔴 Critical (${pct}%)`; advice = "Re-read chapter fundamentals immediately. Attend doubt clearing workspace."; colorBg = "#fef2f2"; }
+      let rowCells = diagTable.appendTableRow();
+      rowCells.appendTableCell(t).setBackgroundColor("#ffffff").setPaddingTop(8).setPaddingBottom(8).editAsText().setFontSize(11).setBold(true).setFontFamily("Arial").setForegroundColor("#0f172a");
+      rowCells.appendTableCell(statusTag).setBackgroundColor(colorBg).setPaddingTop(8).setPaddingBottom(8).editAsText().setFontSize(10).setBold(true).setFontFamily("Arial");
+      rowCells.appendTableCell(advice).setBackgroundColor("#ffffff").setPaddingTop(8).setPaddingBottom(8).editAsText().setFontSize(10).setItalic(true).setFontFamily("Arial").setForegroundColor("#475569");
+    }
+
+    docBody.appendParagraph("").setSpacingBefore(12);
+    try {
+      let barChart = Charts.newColumnChart().setDataTable(topicTableData).setTitle('Diagnostic Analytics Index (%)').setDimensions(520, 240).setColors(['#1e40af']).setYAxisRange(0, 100).build();
+      docBody.appendImage(barChart.getAs('image/png')).setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+    } catch(e) { }
+
+    docBody.appendHorizontalRule();
+    docBody.appendParagraph("📝 Itemized Question Breakdown").setHeading(DocumentApp.ParagraphHeading.HEADING4).editAsText().setFontSize(13).setBold(true).setFontFamily("Arial");
+
+    evalLog.forEach(log => {
+      docBody.appendParagraph(`Q${log.num}. ${log.q}`).setBold(true).setSpacingBefore(16).editAsText().setFontSize(11).setFontFamily("Arial");
+      if (log.isUrl) {
+        docBody.appendParagraph("Answer Field: [Handwritten Image Sheet Reference Logged Below]").setItalic(true).editAsText().setFontSize(10).setForegroundColor("#64748b");
+        try {
+          let fileId = log.a.match(/[-\w]{25,}/)[0];
+          let img = docBody.appendImage(DriveApp.getFileById(fileId).getBlob());
+          if (img.getWidth() > 480) { let height = img.getHeight(); img.setWidth(480); img.setHeight((480 / img.getWidth()) * height); }
+        } catch(imgErr) { docBody.appendParagraph(`Link: ${log.a}`).setLineSpacing(1.1).editAsText().setFontSize(10); }
+      } else {
+        docBody.appendParagraph(`Answer Given: ${log.a}`).setLineSpacing(1.3).editAsText().setFontSize(10).setFontFamily("Arial").setForegroundColor("#1e293b");
+      }
+      docBody.appendParagraph(log.res).setBold(true).setSpacingBefore(4).editAsText().setFontSize(10).setFontFamily("Arial");
+      if(log.note) docBody.appendParagraph(`💡 Evaluation Feedback: ${log.note}`).setItalic(true).setLineSpacing(1.3).editAsText().setFontSize(10).setFontFamily("Arial").setForegroundColor("#475569");
+    });
+
+    docBody.appendHorizontalRule();
+    
+    // FIXED: Uses getDashValue for marketing text
+    let promoTitleText = getDashValue(dash, "Marketing Title");
+    let promoBodyText = getDashValue(dash, "Marketing Body Text");
+    let promoContactText = getDashValue(dash, "Marketing Contact Info");
+    
+    if (promoTitleText) docBody.appendParagraph(promoTitleText).setHeading(DocumentApp.ParagraphHeading.HEADING3).setAlignment(DocumentApp.HorizontalAlignment.CENTER).editAsText().setFontSize(12).setFontFamily("Arial");
+    if (promoBodyText) docBody.appendParagraph(promoBodyText).setAlignment(DocumentApp.HorizontalAlignment.CENTER).setItalic(true).editAsText().setFontSize(10).setFontFamily("Arial");
+    if (promoContactText) docBody.appendParagraph(promoContactText).setAlignment(DocumentApp.HorizontalAlignment.CENTER).setBold(true).editAsText().setFontSize(11).setFontFamily("Arial");
+
+    let waContactNumber = String(getDashValue(dash, "WhatsApp Contact Number")).replace(/[^0-9]/g, "");
+    if (waContactNumber) {
+      docBody.appendParagraph("💬 Click Here to Connect Instantly on WhatsApp").setAlignment(DocumentApp.HorizontalAlignment.CENTER).setBold(true).setLinkUrl(`https://wa.me/${waContactNumber}`).editAsText().setFontSize(11).setFontFamily("Arial").setForegroundColor("#16a34a");
+    }
+
+    doc.saveAndClose(); Utilities.sleep(2000);
+    const pdfUrl = uploadFolder.createFile(DriveApp.getFileById(doc.getId()).getAs('application/pdf')).setName(`${docName}.pdf`).getUrl();
+    DriveApp.getFileById(doc.getId()).setTrashed(true);
+
+    let actualHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    let pdfCol = 0, waCol = 0, scoreCol = 0, evalCol = 0;
+    for (let c = 0; c < actualHeaders.length; c++) {
+      let hText = String(actualHeaders[c]).trim();
+      if (hText.includes("PDF Report")) pdfCol = c + 1;
+      if (hText.includes("WhatsApp")) waCol = c + 1;
+      if (hText === "Score") scoreCol = c + 1;
+      if (hText.includes("Evaluation Status")) evalCol = c + 1;
+    }
+
+    let dynamicScoreStr = `${totalEarnedMarks} / ${totalMaxMarks}`;
+    if (scoreCol > 0) sheet.getRange(row, scoreCol).setValue(dynamicScoreStr);
+    if (pdfCol > 0) sheet.getRange(row, pdfCol).setFormula(`=HYPERLINK("${pdfUrl}", "📥 View PDF")`);
+    if (waCol > 0) sheet.getRange(row, waCol).setFormula(`=HYPERLINK("https://api.whatsapp.com/send?phone=91${phone}&text=${encodeURIComponent(`Test Result: ${dynamicScoreStr}\n\nPDF: ${pdfUrl}`)}", "📱 Send WhatsApp")`);
+    if (evalCol > 0) sheet.getRange(row, evalCol).setValue("✅ Done");
+  } catch (err) { e.range.getSheet().getRange(e.range.getRow(), e.range.getSheet().getLastColumn() + 1).setValue("❌ ERROR: " + err.message); }
+}
