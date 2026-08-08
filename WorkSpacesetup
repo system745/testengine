@@ -1,0 +1,101 @@
+// =========================================================================
+// WORKSPACESETUP.GS - Handles Onboarding & Tab Management
+// =========================================================================
+
+function initializeWorkspace(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dash = ss.getSheetByName("Dashboard");
+  if (!dash) { SpreadsheetApp.getUi().alert("Error: Dashboard tab missing!"); return; }
+
+  const backendEmail = PropertiesService.getScriptProperties().getProperty('BACKEND_EMAIL');
+  if (!backendEmail) { SpreadsheetApp.getUi().alert("System Error: Backend Email not configured in Central Engine."); return; }
+
+  dash.getRange("B6").setValue("🛠️ Initializing SmartGem Workspace...");
+  SpreadsheetApp.flush();
+
+  try {
+    let masterFolder;
+    const folders = DriveApp.getFoldersByName("SmartGem Test Portal");
+    if (folders.hasNext()) masterFolder = folders.next();
+    else masterFolder = DriveApp.createFolder("SmartGem Test Portal");
+    masterFolder.addEditor(backendEmail);
+
+    let reportFolder, reportFolders = masterFolder.getFoldersByName("Report Cards");
+    if (reportFolders.hasNext()) reportFolder = reportFolders.next();
+    else reportFolder = masterFolder.createFolder("Report Cards");
+
+    let vaultFile, vaultFiles = masterFolder.getFilesByName("SmartGem - Master Question Vault");
+    if (vaultFiles.hasNext()) {
+      vaultFile = vaultFiles.next();
+    } else {
+      const templateId = "1jyvlyM0awC6q0zz3_PWcfyJoY9exN1yYTvoIcabvh4g"; 
+      let templateFile = DriveApp.getFileById(templateId);
+      vaultFile = templateFile.makeCopy("SmartGem - Master Question Vault", masterFolder);
+    }
+
+    dash.getRange("B13").setValue(reportFolder.getId());
+    dash.getRange("B14").setValue(vaultFile.getUrl());
+
+    const requiredTabs = [
+      { name: "Master Exam Responses", headers: ["Timestamp", "Test ID", "Student Full Name", "Mobile Number", "Email Address", "Score", "📄 PDF Report", "💬 WhatsApp", "Evaluation Status", "📧 Delivery Status", "Structured Evaluation Payload"] },
+      { name: "System Answer Keys", headers: ["Test ID", "Form Edit URL", "Question Title Lookup Key", "Original Question Title", "Correct Answer", "Explanation", "Question Type", "Question Marks"] },
+      { name: "Active Deployments", headers: ["Deploy Date", "Unique Test ID", "Exam Name", "Exam JSON Payload"] },
+      { name: "Draft Review Queue", headers: ["Action", "Question Type", "Topic", "Question Text", "Options", "Correct Answer", "Explanation / Marking Key", "Source Information"] },
+      { name: "Output Selection Matrix", headers: ["Specific Question IDs (Optional)", "Topic Area", "MCQ Count", "Marks / MCQ", "Total MCQ Marks", "Assertion Count", "Marks / Assertion", "Total Assertion Marks", "Theory Count", "Marks / Theory Q", "Total Theory Marks", "Case Study Count", "Marks / Case Study", "Total Case Marks", "Overall Topic Marks", "Difficulty Level"] },
+      { name: "Topic Weightage", headers: ["Sub-Topic Identified", "AI Suggested Weight (%)", "Your Final Approved Weight (%)"] },
+      { name: "Source Text Cache", headers: ["Status", "URL"] },
+      { name: "Test Archive", headers: ["Date", "Test Name", "Test Link"] }
+    ];
+
+    requiredTabs.forEach(tab => {
+      let s = ss.getSheetByName(tab.name);
+      if (!s) {
+        s = ss.insertSheet(tab.name);
+        s.appendRow(tab.headers);
+        s.getRange(1, 1, 1, tab.headers.length).setFontWeight("bold").setBackground("#2c4c94").setFontColor("white");
+        s.setFrozenRows(1);
+      }
+    });
+
+    let protection = dash.getRange("A1:A25").protect().setDescription('SmartGem Structure');
+    protection.setWarningOnly(true); 
+
+    // --- NEW: PING REGISTRY TO AUTO-ONBOARD CLIENT ---
+    try {
+      const webAppUrl = PropertiesService.getScriptProperties().getProperty('WEB_APP_URL');
+      if (webAppUrl) {
+        let teacherEmail = "Unknown";
+        try { teacherEmail = ss.getOwner().getEmail(); } catch(err) {} 
+        
+        // Helper function to get Institute Name safely
+        const dData = dash.getRange("A1:B30").getValues();
+        let instName = "Unknown Institute";
+        for(let r=0; r<dData.length; r++) {
+           if(String(dData[r][0]).includes("Institute Name")) { instName = dData[r][1]; break; }
+        }
+
+        const pingPayload = { action: "onboardClient", instName: instName, sheetId: ss.getId(), email: teacherEmail };
+        const options = { method: "POST", contentType: "application/json", payload: JSON.stringify(pingPayload), muteHttpExceptions: true, headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() } };
+        UrlFetchApp.fetch(webAppUrl, options);
+      }
+    } catch(e) { console.warn("Onboarding Ping Failed: " + e.message); }
+
+    dash.getRange("B6").setValue("✅ Workspace Ready!");
+    dash.activate(); 
+    SpreadsheetApp.getUi().alert("💎 SmartGem Setup Complete!\n\nAll tabs, folders, and vaults have been successfully generated and formatted.");
+
+  } catch (e) {
+    dash.getRange("B6").setValue("❌ Setup Failed");
+    SpreadsheetApp.getUi().alert("Error during setup: " + e.message);
+  }
+}
+
+function stage6_OrganizeFiles(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dash = ss.getSheetByName("Dashboard");
+  dash.getRange("B6").setValue("Stage 6: Cleaning workspace...");
+  const coreTabs = ["Dashboard", "Output Selection Matrix", "Draft Review Queue", "Source Text Cache", "System Answer Keys", "Active Deployments", "Master Exam Responses"];
+  ss.getSheets().forEach(sheet => { if (!coreTabs.includes(sheet.getName())) sheet.hideSheet(); });
+  dash.getRange("B6").setValue("Workspace Cleanup Completed!");
+  dash.activate(); 
+}
