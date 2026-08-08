@@ -1,0 +1,120 @@
+// =========================================================================
+// ROUTER.GS - Handles Web App Traffic, Quotas, & Menus
+// =========================================================================
+
+function doPost(e) {
+  try {
+    let payload = JSON.parse(e.postData.contents);
+    const props = PropertiesService.getScriptProperties();
+    const registrySs = SpreadsheetApp.openById(props.getProperty('REGISTRY_SHEET_ID'));
+    
+    // --- NEW: CATCH ONBOARDING PING (1-Click Setup) ---
+    if (payload.action === "onboardClient") {
+      const authSheet = registrySs.getSheetByName("Authorized Sheets");
+      const authData = authSheet.getDataRange().getValues();
+      let exists = false;
+      
+      // Check if they are already in the registry
+      for (let i = 1; i < authData.length; i++) {
+        if (authData[i][0] === payload.sheetId) { exists = true; break; }
+      }
+      
+      // If new, add them automatically with 10 default tests!
+      if (!exists) {
+        authSheet.appendRow([payload.sheetId, payload.instName, "Active", payload.email, 10, 0]);
+      }
+      return ContentService.createTextOutput(JSON.stringify({success: true})).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // --- EXISTING: CATCH TEST DEPLOYMENT PING ---
+    if (payload.action === "registerTest") {
+      const authSheet = registrySs.getSheetByName("Authorized Sheets");
+      const authData = authSheet.getDataRange().getValues();
+      let rowIndex = -1, isAuthorized = false, licenseStatus = "Unknown", authEmail = "", totalAllowed = 0, testsUsed = 0;
+      
+      for (let i = 1; i < authData.length; i++) {
+        if (authData[i][0] === payload.sheetId) {
+          rowIndex = i + 1;
+          isAuthorized = true;
+          licenseStatus = authData[i][2];
+          authEmail = authData[i][3];
+          totalAllowed = parseInt(authData[i][4]) || 0;
+          testsUsed = parseInt(authData[i][5]) || 0;
+          break;
+        }
+      }
+      
+      const registrySheet = registrySs.getSheetByName("Registry");
+
+      if (!isAuthorized || licenseStatus !== "Active") {
+        registrySheet.appendRow([payload.testId, payload.instName, payload.sheetId, "BLOCKED (Pirated/Expired)", "", payload.email || "Unknown"]);
+        return ContentService.createTextOutput(JSON.stringify({error: "Unauthorized Workspace or Inactive Subscription. Please contact Admin."})).setMimeType(ContentService.MimeType.JSON);
+      }
+      if (authEmail !== "" && payload.email !== authEmail && payload.email !== "Unknown") {
+        registrySheet.appendRow([payload.testId, payload.instName, payload.sheetId, "BLOCKED (Email Mismatch)", "", payload.email]);
+        return ContentService.createTextOutput(JSON.stringify({error: "Unauthorized User. This workspace is registered to a different email address."})).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      let graceLimit = totalAllowed + 2;
+      if (testsUsed >= graceLimit) {
+        registrySheet.appendRow([payload.testId, payload.instName, payload.sheetId, "BLOCKED (Quota Exceeded)", "", payload.email]);
+        return ContentService.createTextOutput(JSON.stringify({error: `Subscription Limit Reached. You have used ${testsUsed} tests (including your 2 emergency grace tests). Please renew your subscription to continue.`})).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      testsUsed++;
+      authSheet.getRange(rowIndex, 6).setValue(testsUsed); 
+      registrySheet.appendRow([payload.testId, payload.instName, payload.sheetId, "Active", "", payload.email]);
+
+      let messageType = "success";
+      if (testsUsed === totalAllowed) messageType = "warning_empty";
+      else if (testsUsed > totalAllowed) messageType = "grace_period";
+      else if (totalAllowed - testsUsed <= 2) messageType = "warning_low";
+
+      return ContentService.createTextOutput(JSON.stringify({ success: true, testsUsed: testsUsed, totalAllowed: totalAllowed, messageType: messageType })).setMimeType(ContentService.MimeType.JSON);
+    }
+  } catch(err) { return ContentService.createTextOutput(JSON.stringify({error: err.message})).setMimeType(ContentService.MimeType.JSON); }
+}
+
+function doGet(e) {
+  if (e && e.parameter && e.parameter.action === "checkBalance") {
+    try {
+      const registrySs = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty('REGISTRY_SHEET_ID'));
+      const authData = registrySs.getSheetByName("Authorized Sheets").getDataRange().getValues();
+      for (let i = 1; i < authData.length; i++) {
+        if (authData[i][0] === e.parameter.sheetId) {
+          return ContentService.createTextOutput(JSON.stringify({ success: true, status: authData[i][2], total: authData[i][4], used: authData[i][5] })).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({error: "Workspace not found in Registry."})).setMimeType(ContentService.MimeType.JSON);
+    } catch(err) { return ContentService.createTextOutput(JSON.stringify({error: err.message})).setMimeType(ContentService.MimeType.JSON); }
+  }
+
+  let view = (e && e.parameter && e.parameter.view) ? e.parameter.view : "exam";
+  let tid = (e && e.parameter && e.parameter.tid) ? e.parameter.tid : ""; 
+  if (view === 'hub') return HtmlService.createTemplateFromFile('Index').evaluate().setTitle("Mobile Dispatch Hub").addMetaTag('viewport', 'width=device-width, initial-scale=1').setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  if (view === 'practice') return HtmlService.createTemplateFromFile('PracticeList').evaluate().setTitle("Smart Gem Practice Hub").addMetaTag('viewport', 'width=device-width, initial-scale=1').setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  
+  let template = HtmlService.createTemplateFromFile('Exam');
+  template.requestedTestId = (e && e.parameter && e.parameter.testId) ? e.parameter.testId : "";
+  return template.evaluate().setTitle("Smart Gem Assessment Portal").addMetaTag('viewport', 'width=device-width, initial-scale=1').setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function buildTeacherMenu() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('💎 SmartGem')
+    .addItem('🚀 1-Click Initialize / Repair Workspace', 'runInitialize')
+    .addItem('💳 Check Subscription Balance', 'runCheckBalance')
+    .addSeparator()
+    .addItem('🏷️ Auto-Generate IDs for Vault', 'runAutoID') // <-- NEW BUTTON HERE
+    .addSeparator()
+    .addItem('📄 Run Stage 1: Analyze PDF Document(s)', 'runStage1')
+    .addItem('📊 Run Stage 2: Initialize Matrix Blueprint', 'runStage2')
+    .addItem('✅ Check Marks Validation', 'runCheckMarks')
+    .addSeparator()
+    .addItem('🤖 Run Stage 3: Generate Hybrid Review Queue', 'runStage3')
+    .addSeparator()
+    .addItem('🌐 Run Stage 5: Deploy Unique Exam Link', 'runStage5')
+    .addSeparator()
+    .addItem('🧹 Run Stage 6: Organize & Rename Files', 'runStage6')
+    .addToUi();
+}
