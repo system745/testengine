@@ -1,0 +1,156 @@
+// =========================================================================
+// DATAAPI.GS - Handles Data Fetching for Hubs & Catalogs
+// =========================================================================
+
+function getActiveExamSchema(testId) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const registryId = props.getProperty('REGISTRY_SHEET_ID');
+    const registrySs = SpreadsheetApp.openById(registryId);
+    const registrySheet = registrySs.getSheetByName("Registry");
+    
+    const regData = registrySheet.getDataRange().getValues();
+    let teacherSheetId = null, status = null;
+
+    for (let i = 1; i < regData.length; i++) {
+      if (regData[i][0] === testId) {
+        teacherSheetId = regData[i][2];
+        status = regData[i][3];
+        break;
+      }
+    }
+
+    if (!teacherSheetId) return JSON.stringify({ error: "Invalid Exam Code. Please check and try again." });
+    if (status !== "Active") return JSON.stringify({ error: "This institute's subscription is currently inactive." });
+
+    const teacherSs = SpreadsheetApp.openById(teacherSheetId);
+    const deploySheet = teacherSs.getSheetByName("Active Deployments");
+    if (!deploySheet) return JSON.stringify({ error: "Teacher's deployment system not found." });
+    
+    const data = deploySheet.getDataRange().getValues();
+    const examRow = data.find(row => row[1] == testId);
+    if (!examRow) return JSON.stringify({ error: "Exam not found or inactive." });
+
+    let schema = {};
+    let rawPayload = String(examRow[3]).trim();
+    if (!rawPayload.endsWith("}")) {
+      let lastGoodBracket = rawPayload.lastIndexOf("}");
+      if (lastGoodBracket > -1) rawPayload = rawPayload.substring(0, lastGoodBracket + 1);
+    }
+    schema = JSON.parse(rawPayload);
+    if (!schema.durationMinutes) schema.durationMinutes = 45;
+    schema.teacherSheetId = teacherSheetId; 
+    
+    return JSON.stringify(schema);
+  } catch (e) { return JSON.stringify({ error: "System Error: " + e.message }); }
+}
+
+function checkMarksDistribution(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dash = ss.getSheetByName("Dashboard");
+  const matrix = ss.getSheetByName("Output Selection Matrix");
+  
+  // FIXED: Uses getDashValue
+  const targetMarks = parseInt(getDashValue(dash, "Maximum Target Marks")) || 0;
+  const currentTotal = parseInt(matrix.getRange(matrix.getLastRow(), 15).getValue()) || 0; // Column O is 15
+  
+  const ui = SpreadsheetApp.getUi();
+  if (currentTotal === targetMarks) ui.alert("✅ PERFECT MATCH!", `Your matrix totals exactly ${currentTotal} marks.`, ui.ButtonSet.OK);
+  else if (currentTotal > targetMarks) ui.alert("⚠️ OVER LIMIT!", `Target: ${targetMarks}\nCurrent: ${currentTotal}\nYou are OVER by ${currentTotal - targetMarks} marks.`, ui.ButtonSet.OK);
+  else ui.alert("⚠️ UNDER LIMIT!", `Target: ${targetMarks}\nCurrent: ${currentTotal}\nYou are SHORT by ${targetMarks - currentTotal} marks.`, ui.ButtonSet.OK);
+}
+
+function appendToArchive(ss, testName, testLink) {
+  let sheet = ss.getSheetByName("Test Archive") || ss.insertSheet("Test Archive");
+  if (sheet.getLastRow() === 0) sheet.getRange("A1:C1").setValues([["Date", "Test Name", "Test Link"]]).setFontWeight("bold").setBackground("#2c4c94").setFontColor("white");
+  sheet.appendRow([new Date(), testName, testLink]);
+}
+
+function getActiveTestCatalog(teacherSheetId) {
+  try {
+    const ss = SpreadsheetApp.openById(teacherSheetId);
+    const managerSheet = ss.getSheetByName("Test Manager");
+    if (!managerSheet) return { error: "The 'Test Manager' tab was not found." };
+    const data = managerSheet.getDataRange().getValues();
+    const activeCatalog = [];
+    for (let i = 1; i < data.length; i++) {
+      let status = data[i][5] ? data[i][5].toString().trim().toLowerCase() : "";
+      if (status === "active") {
+        activeCatalog.push({ className: data[i][0], subject: data[i][1], chapter: data[i][2], level: data[i][3], testCode: data[i][4] });
+      }
+    }
+    return activeCatalog;
+  } catch (e) { return { error: "Failed to read catalog: " + e.message }; }
+}
+
+function getAvailablePracticeTests(teacherSheetId) {
+  try {
+    const ss = SpreadsheetApp.openById(teacherSheetId);
+    const deploySheet = ss.getSheetByName("Active Deployments");
+    if (!deploySheet) return JSON.stringify([]);
+    const data = deploySheet.getDataRange().getValues();
+    let activeHubList = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][1]) continue;
+      let descriptionStr = "", parsedClass = "General", parsedTopic = "Mixed Concepts", calcLevel = "🟡 Medium";
+      try {
+        let payload = JSON.parse(data[i][3]);
+        descriptionStr = payload.description || "";
+        let match = descriptionStr.match(/(.*?) Mastery - (.*?) \((.*?)\)/);
+        if (match) { parsedTopic = match[2].trim(); parsedClass = match[3].trim(); }
+        else if (payload.fileName) { parsedTopic = payload.fileName.replace("Classes by CMA Tarun Singhal - ", "").trim(); }
+
+        if (payload.questions && payload.questions.length > 0) {
+          let avgPoints = payload.questions.reduce((sum, q) => sum + (q.points || 1), 0) / payload.questions.length;
+          if (avgPoints <= 1.5) calcLevel = "🟢 Easy"; else if (avgPoints <= 2.8) calcLevel = "🟡 Medium";
+          else calcLevel = "🔴 Tough";
+        }
+      } catch(err) { descriptionStr = "Practice Assessment Workspace Available."; }
+      activeHubList.push({ testId: String(data[i][1]).toUpperCase(), examName: String(data[i][2]), targetClass: parsedClass, topic: parsedTopic, level: calcLevel });
+    }
+    return JSON.stringify(activeHubList.reverse());
+  } catch(e) { return JSON.stringify([]); }
+}
+
+function getMobileHubData(teacherSheetId) {
+  try {
+    const ss = SpreadsheetApp.openById(teacherSheetId);
+    const dash = ss.getSheetByName("Dashboard");
+    
+    // FIXED: Uses getDashValue
+    const instName = getDashValue(dash, "Institute Name") || "Smart Gem";
+    let results = [];
+    const responseSheet = ss.getSheetByName("Master Exam Responses");
+    if (!responseSheet) return JSON.stringify({ instName: instName, records: [] });
+    const data = responseSheet.getDataRange().getValues();
+    const formulas = responseSheet.getDataRange().getFormulas();
+    if (data.length <= 1) return JSON.stringify({ instName: instName, records: [] });
+    
+    const timeIdx = data[0].indexOf("Timestamp");
+    const nameIdx = data[0].indexOf("Student Full Name");
+    const mobileIdx = data[0].indexOf("Mobile Number"); 
+    const waIdx = data[0].indexOf("💬 WhatsApp");
+    const examNameIdx = data[0].indexOf("Test ID"); 
+    
+    if (nameIdx !== -1 && waIdx !== -1) {
+      for (let i = 1; i < data.length; i++) {
+        let studentName = data[i][nameIdx];
+        let formula = formulas[i][waIdx];
+        let actualExamName = (examNameIdx !== -1 && data[i][examNameIdx]) ? data[i][examNameIdx] : "General Assessment";
+        let mobileNum = (mobileIdx !== -1 && data[i][mobileIdx]) ? String(data[i][mobileIdx]) : "N/A";
+        let rawTime = 0;
+        if (timeIdx !== -1 && data[i][timeIdx]) {
+          let parsedDate = new Date(data[i][timeIdx]).getTime();
+          if (!isNaN(parsedDate)) rawTime = parsedDate;
+        }
+        if (!studentName || !formula) continue;
+        let urlMatch = formula.match(/"([^"]+)"/);
+        if (urlMatch && urlMatch[1] !== "#") {
+          results.push({ timestamp: rawTime, sheetName: actualExamName, studentName: studentName, mobile: mobileNum, waUrl: urlMatch[1] });
+        }
+      }
+    }
+    results.sort((a, b) => b.timestamp - a.timestamp);
+    return JSON.stringify({ instName: instName, records: results });
+  } catch(e) { return JSON.stringify({ instName: "Error", records: [] }); }
+}
