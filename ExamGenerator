@@ -1,0 +1,487 @@
+// =========================================================================
+// EXAMGENERATOR.GS - Handles AI Drafting, Test Deployment, & Quotas
+// =========================================================================
+
+// --- HELPER FUNCTION: Finds values on the Dashboard even if rows shift ---
+function getDashValue(dash, labelText) {
+  const data = dash.getRange("A1:B30").getValues();
+  for (let i = 0; i < data.length; i++) {
+    if (String(data[i][0]).toLowerCase().includes(labelText.toLowerCase())) {
+      return data[i][1];
+    }
+  }
+  return "";
+}
+
+function stage1_AnalyzeSource(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dash = ss.getSheetByName("Dashboard");
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!apiKey) { SpreadsheetApp.getUi().alert("Error: API Key missing in Central Engine."); return; }
+  
+  const sourceUrls = getDashValue(dash, "Source Document URL");
+  const subject = getDashValue(dash, "Subject");
+  const chapter = getDashValue(dash, "Chapter Title");
+  const customInstructions = getDashValue(dash, "Board Pattern") || "No specific board instructions provided.";
+  const allFileIds = sourceUrls.match(/[-\w]{25,}/g);
+  
+  if (!allFileIds || allFileIds.length === 0) {
+    SpreadsheetApp.getUi().alert("Error: Please paste at least one valid Google Drive PDF link.");
+    return;
+  }
+  dash.getRange("B6").setValue(`Stage 1: Accessing ${allFileIds.length} PDF File(s)...`);
+  
+  let requestParts = [{ text: `You are an expert curriculum developer. Visually analyze the attached document(s) for the chapter "${chapter}" in the subject "${subject}".\nCRITICAL BOARD/PATTERN INSTRUCTIONS:\n${customInstructions}\nKeeping those instructions in mind, identify the distinct core technical sub-topics present.\nReturn a JSON array of objects with exactly two fields: "topic" and "suggestedWeight".\nThe weights should be integers representing percentages, and the total sum of all weights must equal exactly 100.` }];
+  
+  let filesProcessed = 0;
+  allFileIds.forEach(id => {
+    try {
+      const file = DriveApp.getFileById(id);
+      const base64Pdf = Utilities.base64Encode(file.getBlob().getBytes());
+      requestParts.push({ inlineData: { mimeType: "application/pdf", data: base64Pdf } });
+      filesProcessed++;
+    } catch(e) {}
+  });
+  
+  if (filesProcessed === 0) {
+    SpreadsheetApp.getUi().alert("Error: Could not access any of the provided PDFs.");
+    dash.getRange("B6").setValue("Stage 1: Error");
+    return;
+  }
+  
+  let cacheSheet = ss.getSheetByName("Source Text Cache") || ss.insertSheet("Source Text Cache");
+  cacheSheet.clearContents();
+  cacheSheet.getRange("A1:A2").setValues([[`Successfully Linked ${filesProcessed} PDF(s)`], [sourceUrls]]);
+  dash.getRange("B6").setValue(`Stage 1: AI Vision Analyzing ${filesProcessed} PDF(s)...`);
+  
+  try {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+    const payload = { contents: [{ parts: requestParts }], generationConfig: { responseMimeType: "application/json" } };
+    const options = { method: "POST", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true };
+    const response = UrlFetchApp.fetch(endpoint, options);
+    if (response.getResponseCode() !== 200) throw new Error(response.getContentText());
+    
+    const topics = JSON.parse(JSON.parse(response.getContentText()).candidates[0].content.parts[0].text);
+    let weightSheet = ss.getSheetByName("Topic Weightage") || ss.insertSheet("Topic Weightage");
+    weightSheet.clearContents();
+    const header = [["Sub-Topic Identified", "AI Suggested Weight (%)", "Your Final Approved Weight (%)"]];
+    const rowData = topics.map(t => [t.topic, t.suggestedWeight, t.suggestedWeight]);
+    const fullData = header.concat(rowData);
+    weightSheet.getRange(1, 1, fullData.length, 3).setValues(fullData);
+    weightSheet.getRange("A1:C1").setFontWeight("bold").setBackground("#2c4c94").setFontColor("white");
+    dash.getRange("B6").setValue("Stage 2: Awaiting Weightage Approval");
+    
+    weightSheet.activate(); 
+    SpreadsheetApp.getUi().alert(`Stage 1 Complete!\n\nSuccessfully scanned and bundled ${filesProcessed} document(s).`);
+  } catch(error) { SpreadsheetApp.getUi().alert("API Error: " + error.message); }
+}
+
+function stage2_BuildMatrix(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const weightSheet = ss.getSheetByName("Topic Weightage");
+  const dash = ss.getSheetByName("Dashboard");
+  if (!weightSheet) { SpreadsheetApp.getUi().alert("Error: Run Stage 1 first."); return; }
+  
+  // Pull Global Default Marks from Dashboard
+  let mcqMarks = parseFloat(getDashValue(dash, "Default MCQ Marks")) || 1;
+  let arMarks = parseFloat(getDashValue(dash, "Default Assertion-Reason Marks")) || 1;
+  let theoryMarks = parseFloat(getDashValue(dash, "Default Theory Marks")) || 3;
+  let caseMarks = parseFloat(getDashValue(dash, "Default Case Study Marks")) || 4;
+
+  let matrixSheet = ss.getSheetByName("Output Selection Matrix") || ss.insertSheet("Output Selection Matrix");
+  matrixSheet.clear();
+  
+  // UPDATED HEADERS: Question ID is now Column A
+  const headers = ["Specific Question IDs (Optional)", "Topic Area", "MCQ Count", "Marks / MCQ", "Total MCQ Marks", "Assertion Count", "Marks / Assertion", "Total Assertion Marks", "Theory Count", "Marks / Theory Q", "Total Theory Marks", "Case Study Count", "Marks / Case Study", "Total Case Marks", "Overall Topic Marks", "Difficulty Level"];
+  const weightData = weightSheet.getDataRange().getValues();
+  let matrixData = [headers];
+  
+  for (let i = 1; i < weightData.length; i++) {
+    if (weightData[i][0] && i > 0) {
+      const row = i + 1;
+      // UPDATED: Counts start at 0. Marks are pulled from Dashboard. Formulas shifted to match new columns.
+      matrixData.push(["", weightData[i][0], 0, mcqMarks, `=C${row}*D${row}`, 0, arMarks, `=F${row}*G${row}`, 0, theoryMarks, `=I${row}*J${row}`, 0, caseMarks, `=L${row}*M${row}`, `=E${row}+H${row}+K${row}+N${row}`, "Medium"]);
+    }
+  }
+  
+  const last = matrixData.length;
+  matrixData.push(["", "🏆 GRAND TOTAL", "", "", `=SUM(E2:E${last})`, "", "", `=SUM(H2:H${last})`, "", "", `=SUM(K2:K${last})`, "", "", `=SUM(N2:N${last})`, `=SUM(O2:O${last})`, ""]);
+  matrixSheet.getRange(1, 1, matrixData.length, 16).setValues(matrixData);
+  matrixSheet.getRange("A1:P1").setFontWeight("bold").setBackground("#2c4c94").setFontColor("white");
+  
+  if (last > 1) {
+    matrixSheet.getRange(2, 5, last - 1, 1).setBackground("#f3f3f3");
+    matrixSheet.getRange(2, 8, last - 1, 1).setBackground("#f3f3f3");
+    matrixSheet.getRange(2, 11, last - 1, 1).setBackground("#f3f3f3");
+    matrixSheet.getRange(2, 14, last - 1, 1).setBackground("#f3f3f3");
+    matrixSheet.getRange(2, 15, last - 1, 1).setBackground("#d9ead3").setFontWeight("bold");
+    const diffRule = SpreadsheetApp.newDataValidation().requireValueInList(["Easy", "Medium", "High"]).build();
+    matrixSheet.getRange(2, 16, last - 1, 1).setDataValidation(diffRule);
+  }
+  matrixSheet.autoResizeColumns(1, 16);
+  dash.getRange("B6").setValue("Stage 3: Awaiting Matrix Configuration");
+  
+  matrixSheet.activate(); 
+  SpreadsheetApp.getUi().alert("Stage 2 Complete! Matrix generated.\n\nType your desired Question Counts (and any specific Question IDs) before running Stage 3.");
+}
+
+function stage3_GenerateReviewQueue(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dash = ss.getSheetByName("Dashboard");
+  const matrixSheet = ss.getSheetByName("Output Selection Matrix");
+  const cacheSheet = ss.getSheetByName("Source Text Cache");
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  
+  if (!matrixSheet) { SpreadsheetApp.getUi().alert("Error: Run Stage 2 first."); return; }
+  const subject = getDashValue(dash, "Subject");
+  const vaultUrl = getDashValue(dash, "Master Vault URL");
+  const customInstructions = getDashValue(dash, "Board Pattern") || "No specific board instructions provided.";
+  let vaultTargetPct = getDashValue(dash, "Max AI Usage") || 100;
+  if (vaultTargetPct <= 1 && vaultTargetPct > 0) vaultTargetPct = vaultTargetPct * 100;
+  
+  if (!vaultUrl) { SpreadsheetApp.getUi().alert("Error: Please paste your Master Vault URL in the Dashboard."); return; }
+  let vaultSheet = null;
+  try {
+    let vaultId = vaultUrl.match(/[-\w]{25,}/g)[0];
+    vaultSheet = SpreadsheetApp.openById(vaultId).getSheetByName(subject) || SpreadsheetApp.openById(vaultId).getSheets()[0];
+  } catch(e) { SpreadsheetApp.getUi().alert("Vault Access Error: Check your link or sharing permissions."); return; }
+
+  const matrixData = matrixSheet.getDataRange().getValues();
+  let finalReviewQueueRows = [];
+  let vaultPool = [];
+  
+  // Read Vault (Now includes Question ID in Column A)
+  if (vaultSheet) {
+    let vData = vaultSheet.getDataRange().getValues();
+    for (let i = 1; i < vData.length; i++) {
+      if (vData[i][1]) { // Topic is now Column B (index 1)
+        vaultPool.push({
+          id: String(vData[i][0]).trim().toUpperCase(),
+          topic: String(vData[i][1]).trim().toLowerCase(), 
+          type: String(vData[i][2]).trim(), 
+          text: String(vData[i][3]).trim(), 
+          options: String(vData[i][4]).trim(), 
+          answer: String(vData[i][5]).trim(), 
+          explanation: String(vData[i][6]).trim(), 
+          difficulty: String(vData[i][7]).trim()
+        });
+      }
+    }
+  }
+
+  let aiGenerationManifest = [];
+  let totalFromVault = 0;
+  let totalFromAI = 0;
+
+  for (let i = 1; i < matrixData.length - 1; i++) {
+    let specificIdsRaw = String(matrixData[i][0]).trim();
+    let specificIds = specificIdsRaw ? specificIdsRaw.split(",").map(id => id.trim().toUpperCase()) : [];
+    let topicName = matrixData[i][1];
+    
+    if (!topicName || topicName.includes("GRAND TOTAL")) continue;
+    
+    // Counts shifted by 1 column because of ID column
+    let targetMCQ = parseInt(matrixData[i][2]) || 0;
+    let targetAR = parseInt(matrixData[i][5]) || 0;
+    let targetTheory = parseInt(matrixData[i][8]) || 0;
+    let targetCase = parseInt(matrixData[i][11]) || 0;
+    let difficulty = matrixData[i][15] || "Medium";
+    
+    let counts = { "MCQ": targetMCQ, "Assertion-Reason": targetAR, "Theory": targetTheory, "Case Study": targetCase };
+    let pickedIds = [];
+
+    // TIER 1: SPECIFIC IDs
+    specificIds.forEach(id => {
+      let q = vaultPool.find(v => v.id === id);
+      if (q && counts[q.type] > 0) {
+        finalReviewQueueRows.push(["Approved", q.type, q.topic, q.text, q.options, q.answer, q.explanation, `[Vault: ${q.id}]`]);
+        counts[q.type]--; // Deduct from required count
+        pickedIds.push(q.id);
+        totalFromVault++;
+      }
+    });
+
+    // TIER 2 & 3: VAULT RANDOM & AI DRAFT
+    Object.keys(counts).forEach(type => {
+      let totalNeeded = counts[type];
+      if (totalNeeded <= 0) return;
+      
+      // Find available questions not already picked
+      let availableInVault = vaultPool.filter(q => q.topic === topicName.toLowerCase().trim() && q.type === type && !pickedIds.includes(q.id));
+      // Shuffle for randomness
+      availableInVault.sort(() => 0.5 - Math.random());
+
+      let desiredVaultCount = Math.ceil(totalNeeded * (vaultTargetPct / 100));
+      let vaultAllocation = Math.min(desiredVaultCount, availableInVault.length);
+      let aiAllocation = totalNeeded - vaultAllocation;
+
+      // Tier 2: Vault Random
+      for (let k = 0; k < vaultAllocation; k++) {
+        let q = availableInVault[k];
+        finalReviewQueueRows.push(["Approved", q.type, q.topic, q.text, q.options, q.answer, q.explanation, `[Vault: ${q.id || 'Random'}]`]);
+        totalFromVault++;
+      }
+      
+      // Tier 3: AI Draft
+      if (aiAllocation > 0) {
+        totalFromAI += aiAllocation;
+        let existingManifestItem = aiGenerationManifest.find(m => m.topic === topicName);
+        if (!existingManifestItem) {
+          existingManifestItem = { topic: topicName, MCQs: 0, Assertions: 0, TheoryQuestions: 0, CaseStudies: 0, Difficulty: difficulty };
+          aiGenerationManifest.push(existingManifestItem);
+        }
+        if (type === "MCQ") existingManifestItem.MCQs += aiAllocation;
+        else if (type === "Assertion-Reason") existingManifestItem.Assertions += aiAllocation;
+        else if (type === "Theory") existingManifestItem.TheoryQuestions += aiAllocation;
+        else if (type === "Case Study") existingManifestItem.CaseStudies += aiAllocation;
+      }
+    });
+  }
+
+  if (totalFromAI > 0 && aiGenerationManifest.length > 0) {
+    dash.getRange("B6").setValue(`Stage 3: Pulling ${totalFromVault} from Vault. Drafting ${totalFromAI} new items via AI...`);
+    let requestParts = [{ text: `You are an expert curriculum developer. Based ONLY on the attached document(s), generate questions to fill the remaining empty slots of this blueprint:\n${JSON.stringify(aiGenerationManifest)}\nCRITICAL INSTRUCTIONS:\n${customInstructions}\nReturn a strict JSON array of objects. Each object MUST contain:\n"type" (MCQ, Assertion-Reason, Theory, or Case Study)\n"topic" (Exact topic name string match)\n"questionText" (The actual question text)\n"options" (Choices separated by ' | '. Blank for Theory/Case)\n"correctAnswer" (Correct option letter or comprehensive marking string)\n"explanation" (Detailed concept or step-by-step mathematical logic)` }];
+    
+    const sourceUrls = cacheSheet.getRange("A2").getValue().toString();
+    const allFileIds = sourceUrls.match(/[-\w]{25,}/g);
+    if (allFileIds) {
+      allFileIds.forEach(id => {
+        try { requestParts.push({ inlineData: { mimeType: "application/pdf", data: Utilities.base64Encode(DriveApp.getFileById(id).getBlob().getBytes()) } }); } catch(e) {}
+      });
+    }
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+    const payload = { contents: [{ parts: requestParts }], generationConfig: { responseMimeType: "application/json", temperature: 0.2 } };
+    const options = { method: "POST", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true };
+    const response = UrlFetchApp.fetch(endpoint, options);
+
+    if (response.getResponseCode() === 200) {
+      const newQuestions = JSON.parse(JSON.parse(response.getContentText()).candidates[0].content.parts[0].text);
+      newQuestions.forEach(q => finalReviewQueueRows.push(["Pending Review", q.type, q.topic, q.questionText, q.options, q.correctAnswer, q.explanation, "[New AI Draft]"]));
+    } else { SpreadsheetApp.getUi().alert("Gemini Generation Error: " + response.getContentText()); return; }
+  }
+
+  let reviewSheet = ss.getSheetByName("Draft Review Queue") || ss.insertSheet("Draft Review Queue");
+  reviewSheet.clear();
+  reviewSheet.appendRow(["Action", "Question Type", "Topic", "Question Text", "Options", "Correct Answer", "Explanation / Marking Key", "Source Information"]);
+  reviewSheet.getRange("A1:H1").setFontWeight("bold").setBackground("#2c4c94").setFontColor("white");
+  if (finalReviewQueueRows.length > 0) {
+    reviewSheet.getRange(2, 1, finalReviewQueueRows.length, 8).setValues(finalReviewQueueRows);
+    const actionRule = SpreadsheetApp.newDataValidation().requireValueInList(["Pending Review", "Approved", "Regenerate", "Reject"]).build();
+    reviewSheet.getRange(2, 1, reviewSheet.getLastRow() - 1, 1).setDataValidation(actionRule).setFontWeight("bold");
+  }
+  dash.getRange("B6").setValue("Stage 4: Awaiting Hybrid Data Review");
+  
+  reviewSheet.activate(); 
+  SpreadsheetApp.getUi().alert("📊 Engine Compilation Summary", `✅ Retrieved from Vault Inventory: ${totalFromVault} Question(s)\n🤖 Dynamically Drafted by Gemini: ${totalFromAI} Question(s)\n\nCheck your 'Draft Review Queue' tab to view the results!`, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+function stage5_DeployExam(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dash = ss.getSheetByName("Dashboard");
+  const reviewSheet = ss.getSheetByName("Draft Review Queue");
+  const matrixSheet = ss.getSheetByName("Output Selection Matrix");
+
+  const subject = getDashValue(dash, "Subject") || "Subject";
+  const chapter = getDashValue(dash, "Chapter Title") || "Chapter";
+  const targetGrade = getDashValue(dash, "Target Grade") || "Grade";
+  const vaultUrl = getDashValue(dash, "Master Vault URL");
+  const instName = getDashValue(dash, "Institute Name") || "Smart Gem";
+  
+  // NEW: Custom Exam Title & Logo
+  const displayTitle = getDashValue(dash, "Exam Display Title") || `${instName} - ${chapter}`;
+  let logoLinkRaw = getDashValue(dash, "Institute Logo Link") || "";
+  let logoLink = logoLinkRaw;
+  
+  // Convert Google Drive link to direct image link for the Web App
+  if (logoLinkRaw.includes("drive.google.com")) {
+    let match = logoLinkRaw.match(/[-\w]{25,}/);
+    if (match) logoLink = "https://drive.google.com/uc?id=" + match[0];
+  }
+
+  const reviewData = reviewSheet.getDataRange().getValues();
+  let approvedQuestions = [];
+  let newQuestionsToVault = [];
+  let marksMap = {};
+
+  if (matrixSheet) {
+    let mData = matrixSheet.getDataRange().getValues();
+    for(let i=1; i<mData.length-1; i++) {
+      // Shifted columns for marks lookup
+      if(mData[i][1]) marksMap[mData[i][1].toLowerCase().trim()] = { MCQ: parseInt(mData[i][3])||1, AR: parseInt(mData[i][6])||1, Theory: parseInt(mData[i][9])||3, Case: parseInt(mData[i][12])||4 };
+    }
+  }
+
+  for (let i = 1; i < reviewData.length; i++) {
+    if (reviewData[i][0] === "Approved") {
+      let qTopic = String(reviewData[i][2]).toLowerCase().trim();
+      let qType = reviewData[i][1];
+      let pts = 1;
+      if (marksMap[qTopic]) pts = marksMap[qTopic][qType === "Assertion-Reason" ? "AR" : qType] || 1;
+      let qObj = { type: qType, topic: reviewData[i][2], text: reviewData[i][3], options: reviewData[i][4] || "", points: pts, correctAnswer: reviewData[i][5], explanation: reviewData[i][6], source: reviewData[i][7] };
+      approvedQuestions.push(qObj);
+      
+      // If it's a new AI draft, send it to the vault (Leave ID blank so Auto-ID can tag it later)
+      if (qObj.source === "[New AI Draft]") newQuestionsToVault.push(["", qObj.topic, qObj.type, qObj.text, qObj.options, qObj.correctAnswer, qObj.explanation, "Medium"]);
+    }
+  }
+
+  if (approvedQuestions.length === 0) { SpreadsheetApp.getUi().alert("No questions marked 'Approved'."); return; }
+  dash.getRange("B6").setValue("Stage 5: Packaging Custom Exam App...");
+  
+  let uniqueTestId = "SG-" + Math.floor(10000 + Math.random() * 90000);
+  let deploySheet = ss.getSheetByName("Active Deployments") || ss.insertSheet("Active Deployments");
+  if (deploySheet.getLastRow() === 0) {
+    deploySheet.appendRow(["Deploy Date", "Unique Test ID", "Exam Name", "Exam JSON Payload"]);
+    deploySheet.getRange("A1:D1").setFontWeight("bold").setBackground("#2c4c94").setFontColor("white");
+  }
+
+  const currentDuration = getDashValue(dash, "Maximum Time") || 45;
+  
+  // NEW: Payload now includes the Custom Title and Logo!
+  let examPayload = { fileName: displayTitle, description: `${subject} Mastery - ${chapter} (${targetGrade})`, logo: logoLink, questions: approvedQuestions, durationMinutes: currentDuration };
+  deploySheet.appendRow([new Date(), uniqueTestId, displayTitle, JSON.stringify(examPayload)]);
+
+  let keySheet = ss.getSheetByName("System Answer Keys") || ss.insertSheet("System Answer Keys");
+  if (keySheet.getLastRow() === 0) {
+    keySheet.appendRow(["Test ID", "Form Edit URL", "Question Title Lookup Key", "Original Question Title", "Correct Answer", "Explanation", "Question Type", "Question Marks"]);
+    keySheet.getRange("A1:H1").setFontWeight("bold").setBackground("#2c4c94").setFontColor("white");
+  }
+  const cleanStr = function(str) { return String(str).toLowerCase().replace(/[^a-z0-9]/g, "").trim(); };
+  approvedQuestions.forEach(q => {
+    let fullTitle = `[${q.topic}] ${q.text}`;
+    keySheet.appendRow([uniqueTestId, "Custom App", cleanStr(fullTitle), fullTitle, q.correctAnswer || "", q.explanation || "", q.type, q.points]);
+  });
+
+  if (newQuestionsToVault.length > 0 && vaultUrl) {
+    try {
+      let vaultId = vaultUrl.match(/[-\w]{25,}/g)[0];
+      let vaultSs = SpreadsheetApp.openById(vaultId);
+      let vaultSheet = vaultSs.getSheetByName(subject) || vaultSs.insertSheet(subject);
+      if (vaultSheet.getLastRow() === 0) vaultSheet.appendRow(["Question ID", "Topic", "Type", "Question", "Options", "Answer", "Explanation", "Difficulty"]);
+      vaultSheet.getRange(vaultSheet.getLastRow() + 1, 1, newQuestionsToVault.length, 8).setValues(newQuestionsToVault);
+    } catch (e) { console.warn("Could not reach Master Vault."); }
+  }
+
+  // --- PING THE CENTRAL REGISTRY (WITH QUOTA & GRACE PERIOD) ---
+  try {
+    const webAppUrl = PropertiesService.getScriptProperties().getProperty('WEB_APP_URL');
+    if (!webAppUrl) {
+      SpreadsheetApp.getUi().alert("Error: WEB_APP_URL is missing in Script Properties.");
+    } else {
+      let teacherEmail = "Unknown";
+      try { teacherEmail = ss.getOwner().getEmail(); } catch(err) {} 
+      
+      const pingPayload = { action: "registerTest", testId: uniqueTestId, instName: instName, sheetId: ss.getId(), email: teacherEmail };
+      const options = { method: "POST", contentType: "application/json", payload: JSON.stringify(pingPayload), muteHttpExceptions: true, headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() } };
+      
+      let response = UrlFetchApp.fetch(webAppUrl, options);
+      let responseText = response.getContentText();
+      
+      if (responseText.startsWith("<")) {
+        SpreadsheetApp.getUi().alert("🚨 HTML Error received. Google blocked the ping.");
+        return; 
+      } else {
+        let result = JSON.parse(responseText);
+        if (result.error) {
+          SpreadsheetApp.getUi().alert("🛑 DEPLOYMENT BLOCKED:\n\n" + result.error);
+          return; 
+        }
+        
+        // UPDATE DASHBOARD QUOTA CELLS (Using helper to find rows)
+        const dData = dash.getRange("A1:B30").getValues();
+        for(let r=0; r<dData.length; r++) {
+           if(String(dData[r][0]).includes("Subscription Status")) dash.getRange(r+1, 2).setValue(result.status || "Active");
+           if(String(dData[r][0]).includes("Tests Used")) dash.getRange(r+1, 2).setValue(`${result.testsUsed} / ${result.totalAllowed}`);
+        }
+
+        let msg = `Deployment Complete!\n\nYour test is live. Unique Link ID: ${uniqueTestId}\n\nTell your students to go to your website and enter this code!`;
+        if (result.messageType === "warning_low") msg += `\n\n⚠️ NOTICE: You have used ${result.testsUsed} out of ${result.totalAllowed} tests. Please renew soon!`;
+        else if (result.messageType === "warning_empty") msg += `\n\n⚠️ WARNING: You have used ${result.testsUsed} out of ${result.totalAllowed} tests. Your standard quota is empty!`;
+        else if (result.messageType === "grace_period") msg += `\n\n❤️ GRACE PERIOD ACTIVE: You have exceeded your quota (${result.testsUsed}/${result.totalAllowed}). We have allowed this test to deploy so your class is not interrupted. This will be adjusted in your next billing cycle. Please renew immediately.`;
+        
+        SpreadsheetApp.getUi().alert(msg);
+      }
+    }
+  } catch(e) { 
+    SpreadsheetApp.getUi().alert("Ping Failed: " + e.message); 
+    return;
+  }
+
+  try {
+    let baseAppUrl = PropertiesService.getScriptProperties().getProperty('WEB_APP_URL') || "https://www.smartgem.in";
+    let finalLink = baseAppUrl + "?testId=" + uniqueTestId;
+    appendToArchive(ss, displayTitle, finalLink);
+  } catch(e) {}
+
+  dash.getRange("B6").setValue("Custom App Deployed Successfully!");
+  deploySheet.activate(); 
+}
+
+// --- NEW FUNCTION: CHECK BALANCE ---
+function checkSubscriptionBalance(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  try {
+    const webAppUrl = PropertiesService.getScriptProperties().getProperty('WEB_APP_URL');
+    const pingUrl = webAppUrl + "?action=checkBalance&sheetId=" + ss.getId();
+    let response = UrlFetchApp.fetch(pingUrl, { muteHttpExceptions: true, headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() } });
+    let result = JSON.parse(response.getContentText());
+    
+    if (result.error) {
+      SpreadsheetApp.getUi().alert("Error: " + result.error);
+    } else {
+      SpreadsheetApp.getUi().alert(`💳 SUBSCRIPTION STATUS\n\nStatus: ${result.status}\nTests Used: ${result.used}\nTotal Allowed: ${result.total}\n\nRemaining Standard Tests: ${Math.max(0, result.total - result.used)}`);
+      
+      const dash = ss.getSheetByName("Dashboard");
+      const dData = dash.getRange("A1:B30").getValues();
+      for(let r=0; r<dData.length; r++) {
+         if(String(dData[r][0]).includes("Subscription Status")) dash.getRange(r+1, 2).setValue(result.status);
+         if(String(dData[r][0]).includes("Tests Used")) dash.getRange(r+1, 2).setValue(`${result.used} / ${result.total}`);
+      }
+    }
+  } catch(e) { SpreadsheetApp.getUi().alert("Failed to check balance: " + e.message); }
+}
+
+// =========================================================================
+// VAULT UTILITIES
+// =========================================================================
+function autoGenerateVaultIDs(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dash = ss.getSheetByName("Dashboard");
+  const vaultUrl = getDashValue(dash, "Master Vault URL");
+  
+  if (!vaultUrl) {
+    SpreadsheetApp.getUi().alert("Error: Master Vault URL is missing from the Dashboard.");
+    return;
+  }
+  
+  try {
+    let vaultId = vaultUrl.match(/[-\w]{25,}/)[0];
+    let vaultSs = SpreadsheetApp.openById(vaultId);
+    let subject = getDashValue(dash, "Subject");
+    let vaultSheet = vaultSs.getSheetByName(subject) || vaultSs.getSheets()[0];
+    
+    const data = vaultSheet.getDataRange().getValues();
+    let idsGenerated = 0;
+    
+    // Start at row 2 (index 1) to skip headers
+    for (let i = 1; i < data.length; i++) {
+      let currentId = data[i][0]; // Column A (Question ID)
+      let question = data[i][3];  // Column D (Question Text)
+      
+      // If there is a question, but NO ID, generate one!
+      if (question && String(question).trim() !== "" && (!currentId || String(currentId).trim() === "")) {
+        let newId = "Q-" + Math.floor(100000 + Math.random() * 900000);
+        vaultSheet.getRange(i + 1, 1).setValue(newId);
+        idsGenerated++;
+      }
+    }
+    
+    if (idsGenerated > 0) {
+      SpreadsheetApp.getUi().alert(`✅ Success!\n\nGenerated ${idsGenerated} new Question IDs in your Vault.`);
+    } else {
+      SpreadsheetApp.getUi().alert(`ℹ️ No new IDs needed.\n\nAll questions in the Vault already have IDs, or the Vault is empty.`);
+    }
+  } catch (e) {
+    SpreadsheetApp.getUi().alert("Error accessing Vault: " + e.message);
+  }
+}
